@@ -11,18 +11,7 @@ async function completion(messages,temperature,schema,name){
 }
 function trimHistory(v){if(!Array.isArray(v))return [];return v.slice(0,8).map(x=>({question:String(x?.question||'').slice(0,180),answer:String(x?.answer||'').slice(0,350)})).filter(x=>x.question)}
 const questionSystem=`You are movie buddy, an expert cinematic conversational movie recommender. Respond with concise, natural English. Generate one genuinely adaptive either/or question based on entire conversation. Two short distinct mutually exclusive answers, no spoilers and no repeating an already asked theme. Ask for useful preference information (mood, tone, pacing, style, genre, time commitment, willingness to be challenged); prioritize what helps find films tonight. Consider all free-text exactly as expressed, including hard constraints. The temperature setting changes output sampling, not the goal. After 3-7 answered questions, set done=true ONLY if preferences are specific enough for 3 meaningful recommendations. Never stop before 3 answers. Always stop at 8 questions. If done=true put empty strings for question and options. Return only structured response.`;
-const recommendSystem=`You are a film curator recommending REAL EXISTING FEATURE FILMS, no invented titles. Recommend exactly 9 DISTINCT plausible film candidates matching this person's stated preferences, ranked strongest first. Consider specific free-form restrictions carefully. Include accurate original or standard English movie title and release year; concise personalised reason <=100 characters with no spoilers. Vary genres, countries and eras when appropriate, but prioritize match. Temperature controls sampling creativity, NOT obscure-film popularity. Avoid duplicating any excluded films supplied. Movies must exist in TMDB. Return structured response.`;
-async function tmdb(path,params={}){
- const url=new URL('https://api.themoviedb.org/3'+path);for(const [k,v] of Object.entries(params))url.searchParams.set(k,String(v));
- const r=await fetch(url,{headers:{Authorization:`Bearer ${process.env.TMDB_API_READ_ACCESS_TOKEN}`,'accept':'application/json'}});if(!r.ok)throw new Error(`TMDB returned ${r.status}`);return r.json();
-}
-async function verifiedMovie(candidate){
- const results=await tmdb('/search/movie',{query:candidate.title,year:candidate.year,include_adult:false});let match=results.results?.find(m=>m.release_date?.startsWith(String(candidate.year)) && (m.title.toLowerCase()===candidate.title.toLowerCase()||m.original_title.toLowerCase()===candidate.title.toLowerCase()));
- if(!match)match=results.results?.find(m=>m.release_date?.startsWith(String(candidate.year)));
- if(!match)return null;
- const detail=await tmdb(`/movie/${match.id}`,{language:'en-US'});
- return {id:detail.id,title:detail.title,year:(detail.release_date||'').slice(0,4),poster:detail.poster_path?`https://image.tmdb.org/t/p/w500${detail.poster_path}`:null,overview:detail.overview,runtime:detail.runtime,genres:(detail.genres||[]).map(g=>g.name).slice(0,2),reason:candidate.reason,tmdb:`https://www.themoviedb.org/movie/${detail.id}`};
-}
+const recommendSystem=`You are a film curator recommending REAL EXISTING FEATURE FILMS, no invented titles. Recommend exactly 3 DISTINCT plausible film candidates matching this person's stated preferences, ranked strongest first. Consider specific free-form restrictions carefully. Include accurate original or standard English movie title and release year; concise personalised reason <=100 characters with no spoilers. Vary genres, countries and eras when appropriate, but prioritize match. Temperature controls sampling creativity, NOT obscure-film popularity. Avoid duplicating any excluded films supplied. Use only real existing films, with their correct release years. Never invent titles or claim to have verified them. Return structured response.`;
 module.exports=async (req,res)=>{
  if(req.method!=='POST')return respond(res,405,{error:'Method not allowed'});
  if(!process.env.OPENAI_API_KEY)return respond(res,503,{error:'OPENAI_API_KEY is missing in Vercel settings.'});
@@ -39,14 +28,22 @@ module.exports=async (req,res)=>{
    return respond(res,200,{done:false,question:value.question,options:[value.optionA,value.optionB]});
   }
   if(action==='recommend'){
-   if(!process.env.TMDB_API_READ_ACCESS_TOKEN)return respond(res,503,{error:'TMDB_API_READ_ACCESS_TOKEN is missing in Vercel settings.'});
    const excluded=Array.isArray(exclude)?exclude.slice(0,30).map(x=>String(x).slice(0,150)):[];
-   const result=await completion([{role:'system',content:recommendSystem},{role:'user',content:JSON.stringify({history,exclude:excluded})}],temperature,MOVIES_SCHEMA,'movie_recommendations');
-   const candidates=(result.movies||[]).slice(0,12).filter(x=>!excluded.some(e=>e.toLowerCase()===x.title.toLowerCase()));
-   const verified=await Promise.allSettled(candidates.map(verifiedMovie));let movies=verified.filter(x=>x.status==='fulfilled'&&x.value).map(x=>x.value);
-   movies=[...new Map(movies.map(x=>[x.id,x])).values()].slice(0,3);
-   if(movies.length<3)return respond(res,502,{error:'Could not verify three matching films. Please try again.'});
-   return respond(res,200,{movies});
+   for(let attempt=0;attempt<2;attempt++){
+    const result=await completion([
+      {role:'system',content:recommendSystem},
+      {role:'user',content:JSON.stringify({history,exclude:excluded,task:'Recommend three different existing films that respect the answers. Avoid all excluded titles.'})}
+    ],temperature,MOVIES_SCHEMA,'movie_recommendations');
+    const unique=new Map();
+    for(const film of (result.movies||[])){
+      if(typeof film.title!=='string'||!film.title.trim()||!Number.isInteger(film.year)||film.year<1888||film.year>new Date().getFullYear()+1)continue;
+      const key=film.title.trim().toLocaleLowerCase('en');
+      if(excluded.some(e=>e.trim().toLocaleLowerCase('en')===key)||unique.has(key))continue;
+      unique.set(key,{title:film.title.trim(),year:film.year,reason:String(film.reason||'').slice(0,240)});
+    }
+    if(unique.size===3)return respond(res,200,{movies:[...unique.values()]});
+   }
+   return respond(res,502,{error:'Could not generate three distinct films. Please try again.'});
   }
   return respond(res,400,{error:'Unknown action'});
  }catch(e){console.error('movie buddy request error',e.message);return respond(res,502,{error:e.name==='AbortError'?'The request timed out. Please retry.': 'The recommendation service is temporarily unavailable. Please try again.'})}
