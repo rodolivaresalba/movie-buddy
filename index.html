@@ -18,37 +18,58 @@ const palettes={
 function screen(name){document.querySelectorAll('.screen').forEach(x=>x.classList.toggle('active',x.id===name));window.scrollTo(0,0)}
 function tempInfo(){const t=temp();el('tempText').textContent=t<.5?'Keeping it familiar.':t<1.1?'A little adventure, a little familiarity.':t<1.6?"Let's try something unexpected.":'Anything goes. Surprise me!'}
 function loading(value){el('start').disabled=value;el('again').disabled=value;el('skip').disabled=value;el('freeText').disabled=value;el('back').disabled=value;document.querySelectorAll('.choice').forEach(x=>x.disabled=value)}
-function stopPending(){clearTimeout(updateTimer);updateTimer=null;generation++;if(requestController){requestController.abort();requestController=null;}loading(false)}
+function stopPending(){
+ clearTimeout(updateTimer);updateTimer=null;
+ generation++;
+ if(requestController){requestController.abort();requestController=null;}
+ activeAction='';loading(false);
+}
 async function api(action,extra={},serial){
  const controller=new AbortController();requestController=controller;
- const response=await fetch('/api/chat',{method:'POST',signal:controller.signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({action,temperature:temp(),history,...extra})});
- const json=await response.json().catch(()=>({}));
- if(serial!==generation)throw new DOMException('Superseded','AbortError');
- if(!response.ok)throw new Error(json.error||'Something went wrong');return json;
+ const timeout=setTimeout(()=>controller.abort(),32000);
+ try{
+  const response=await fetch('/api/chat',{
+   method:'POST',signal:controller.signal,
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({action,temperature:temp(),history,...extra})
+  });
+  const json=await response.json().catch(()=>({}));
+  if(serial!==generation)throw new DOMException('Superseded','AbortError');
+  if(!response.ok)throw new Error(json.error||'Something went wrong');
+  return json;
+ }finally{clearTimeout(timeout)}
 }
 async function nextQuestion(){
- stopPending();const serial=generation;activeAction='question';loading(true);screen('quiz');
+ if(history.length>=8){return recommendations();}
+ stopPending();const serial=generation;activeAction='question';current=null;loading(true);el('choices').replaceChildren();screen('quiz');
  el('quizStatus').classList.remove('error');el('quizStatus').textContent='Finding your next question…';
  el('counter').textContent=String(history.length+1).padStart(2,'0')+' / 08';el('fill').style.width=((history.length+1)/8*100)+'%';
- if(history.length>=8){loading(false);return recommendations()}
  try{
   const q=await api('question',{},serial);if(serial!==generation)return;
-  if(q.done){loading(false);return recommendations()}
+  if(q.done){return recommendations()}
+  if(!Array.isArray(q.options)||q.options.length!==2)throw new Error('Question response was incomplete');
   current=q;el('question').textContent=q.question;
   el('choices').replaceChildren(...q.options.map((answer,i)=>{
    const b=document.createElement('button');b.className='choice';const label=document.createElement('span');label.className='num';label.textContent='0'+(i+1)+' ↗';
    const title=document.createElement('strong');title.textContent=answer;b.append(label,title);b.onclick=()=>submit(answer);return b;
   }));el('freeText').value='';el('quizStatus').textContent='';
- }catch(e){if(e.name!=='AbortError' && serial===generation){el('quizStatus').classList.add('error');el('quizStatus').textContent=e.message+' Please try again.'}}
+ }catch(e){if(e.name!=='AbortError' && serial===generation){el('quizStatus').classList.add('error');el('quizStatus').textContent=e.name==='AbortError'?'Request timed out. Use Back and try again.':e.message+' Use Back and try again.'}}
  finally{if(serial===generation){loading(false);requestController=null;activeAction=''}}
 }
-async function submit(answer){if(activeAction)return;history.push({question:current.question,answer});await nextQuestion()}
+async function submit(answer){
+ if(activeAction || !current || history.length>=8)return;
+ history.push({question:current.question,answer});
+ current=null;
+ if(history.length===8){await recommendations();return;}
+ await nextQuestion();
+}
 function colors(film){const base=palettes[film.palette]||palettes.neutral;const seed=[...film.title].reduce((n,ch)=>n+ch.charCodeAt(0),0);const shade=seed%2===0?base:[base[1],base[0],base[2]];return `linear-gradient(${115+(seed%65)}deg,${shade.join(',')})`}
 async function recommendations(){
  stopPending();const serial=generation;activeAction='recommend';loading(true);screen('results');resultsLoaded=false;
  el('resultStatus').classList.remove('error');el('resultStatus').textContent='Finding your films…';
  try{
   const result=await api('recommend',{exclude:[...seen]},serial);if(serial!==generation)return;
+  if(!Array.isArray(result.movies)||result.movies.length!==3)throw new Error('Movie response was incomplete');
   const cards=result.movies.map((film,i)=>{
    seen.add(film.title);const article=document.createElement('article');article.className='card';
    const poster=document.createElement('div');poster.className='poster';poster.style.background=colors(film);
@@ -65,7 +86,11 @@ async function recommendations(){
 function reset(){stopPending();history=[];current=null;seen.clear();resultsLoaded=false;el('temp').value='0.7';tempInfo();el('quizStatus').textContent='';el('resultStatus').textContent='';screen('intro')}
 el('start').onclick=nextQuestion;el('skip').onclick=()=>submit('Skip / No preference');
 el('freeForm').onsubmit=e=>{e.preventDefault();const value=el('freeText').value.trim();if(value)submit(value)};
-el('back').onclick=()=>{if(history.length){history.pop();nextQuestion()}else{stopPending();screen('intro')}};
+el('back').onclick=()=>{
+ if(activeAction)return;
+ if(history.length){history.pop();current=null;nextQuestion()}
+ else{stopPending();current=null;screen('intro')}
+};
 el('restart').onclick=reset;el('again').onclick=()=>{seen.clear();recommendations()};
 el('temp').oninput=()=>{
  tempInfo();const visible=document.querySelector('.screen.active')?.id;
